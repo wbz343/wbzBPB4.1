@@ -1,87 +1,223 @@
-
-name: Update and Obfuscate Worker
+name: Auto Update BPB Panel to Latest
 
 on:
   schedule:
-    - cron: '0 0 * * *'   # 每天00:00 UTC运行
-  workflow_dispatch:      # 允许手动触发
+    # 每天 UTC 时间 03:15 运行（北京时间 11:15）
+    - cron: '15 3 * * *'
+  
+  # 支持手动触发
+  workflow_dispatch:
+  
+  # 当更新本工作流文件时也触发
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/update-bpb.yml'
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 jobs:
-  update-and-obfuscate:
+  update-and-deploy:
     runs-on: ubuntu-latest
-
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    
     steps:
-      - name: Checkout 仓库
+      # 步骤 1: 检出代码
+      - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: 设置 Node.js 环境
-        uses: actions/setup-node@v4
         with:
-          node-version: "latest"
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
-      - name: 安装依赖
+      # 步骤 2: 设置 Git 身份信息
+      - name: Setup Git
         run: |
-          npm install -g javascript-obfuscator
-          sudo apt-get update
-          sudo apt-get install -y jq curl unzip
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
 
-      - name: 获取最新 release tag
-        id: get_release
+      # 步骤 3: 获取最新版本标签
+      - name: Get latest release tag
+        id: get_version
         run: |
-          latest_tag=$(curl -s https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases/latest | jq -r '.tag_name')
-          echo "最新版本: $latest_tag"
-          echo "latest_tag=$latest_tag" >> $GITHUB_ENV
-
-      - name: 读取当前版本号
-        id: read_version
-        run: |
-          if [ -f "version.txt" ]; then
-            current_version=$(cat version.txt | tr -d '\n' | tr -d '\r')
-          else
-            current_version=""
+          # 使用 GitHub API 获取最新发布版本
+          LATEST_TAG=$(curl -s -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases/latest \
+            | grep '"tag_name"' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          
+          if [ -z "$LATEST_TAG" ]; then
+            echo "❌ Failed to get latest tag"
+            exit 1
           fi
-          echo "当前版本: $current_version"
-          echo "current_version=$current_version" >> $GITHUB_ENV
+          
+          echo "LATEST_TAG=$LATEST_TAG" >> $GITHUB_ENV
+          echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "Latest BPB version: $LATEST_TAG"
 
-      - name: 判断是否更新
+      # 步骤 4: 检查是否需要更新
+      - name: Check if already up-to-date
         id: check_update
         run: |
-          if [ "$current_version" = "$latest_tag" ]; then
-            echo "need_update=false" >> $GITHUB_ENV
-            echo "无需更新"
+          # 检查当前版本记录文件
+          if [ -f "current_version.txt" ]; then
+            CURRENT_VERSION=$(cat current_version.txt)
+            echo "Current version: $CURRENT_VERSION"
+            echo "Latest version: $LATEST_TAG"
+            
+            if [ "$CURRENT_VERSION" = "$LATEST_TAG" ]; then
+              echo "✅ Already at latest version ($LATEST_TAG)"
+              echo "skip_update=true" >> $GITHUB_OUTPUT
+              exit 0
+            else
+              echo "📦 Update available: $CURRENT_VERSION -> $LATEST_TAG"
+              echo "skip_update=false" >> $GITHUB_OUTPUT
+            fi
           else
-            echo "need_update=true" >> $GITHUB_ENV
-            echo "需要更新"
+            echo "📝 No version record found. First-time setup."
+            echo "skip_update=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: 下载最新版 worker.js
+      # 步骤 5: 下载最新发布包
+      - name: Download latest release
+        if: steps.check_update.outputs.skip_update == 'false'
         run: |
-          curl -L -o origin.js "https://github.com/bia-pain-bache/BPB-Worker-Panel/releases/download/${{ env.latest_tag }}/worker.js"
+          echo "📥 Downloading worker.zip from release $LATEST_TAG..."
+          
+          # 下载 worker.zip
+          curl -L -o worker.zip \
+            "https://github.com/bia-pain-bache/BPB-Worker-Panel/releases/download/$LATEST_TAG/worker.zip"
+          
+          # 验证下载是否成功
+          if [ ! -f "worker.zip" ]; then
+            echo "❌ Failed to download worker.zip"
+            exit 1
+          fi
+          
+          FILE_SIZE=$(ls -lh worker.zip | awk '{print $5}')
+          echo "✅ Downloaded worker.zip ($FILE_SIZE)"
 
-      - name: 混淆 JS 代码
+      # 步骤 6: 解压并部署静态文件
+      - name: Extract and deploy files
+        if: steps.check_update.outputs.skip_update == 'false'
         run: |
-          javascript-obfuscator origin.js --output _worker.js \
-            --compact true \
-            --identifier-names-generator hexadecimal \
-            --rename-globals false \
-            --string-array false \
-            --transform-object-keys false \
-            --self-defending false \
-            --simplify true
+          echo "📂 Extracting worker.zip..."
+          
+          # 清理旧的提取目录
+          rm -rf extracted
+          
+          # 创建提取目录
+          mkdir -p extracted
+          
+          # 解压文件
+          if ! unzip -o worker.zip -d extracted/; then
+            echo "❌ Failed to extract worker.zip"
+            exit 1
+          fi
+          
+          echo "📁 Extracted contents:"
+          ls -la extracted/
+          
+          # 检查解压内容结构
+          if [ -f "extracted/_worker.js" ]; then
+            echo "✅ Found _worker.js in root of extracted files"
+            cp extracted/_worker.js ./
+          else
+            # 尝试在子目录中查找
+            echo "🔍 Looking for _worker.js in subdirectories..."
+            find extracted -name "_worker.js" -exec cp {} ./ \;
+          fi
+          
+          # 复制所有静态文件到当前目录
+          echo "📄 Copying static files..."
+          
+          # 查找并复制 HTML 文件
+          find extracted -name "*.html" -exec cp {} ./ \;
+          
+          # 查找并复制 JS 文件
+          find extracted -name "*.js" ! -path "*/node_modules/*" -exec cp {} ./ \;
+          
+          # 查找并复制 CSS 文件
+          find extracted -name "*.css" -exec cp {} ./ \;
+          
+          # 查找并复制其他静态资源
+          find extracted -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.gif" -o -name "*.svg" -o -name "*.ico" -o -name "*.woff" -o -name "*.woff2" -o -name "*.ttf" -o -name "*.json" | while read file; do
+            cp "$file" ./
+          done
+          
+          # 检查是否复制了必要的文件
+          echo "📊 Files copied to repository root:"
+          ls -la *.html *.js *.css 2>/dev/null || true
+          
+          # 保存版本信息
+          echo "$LATEST_TAG" > current_version.txt
+          
+          # 清理临时文件
+          rm -rf extracted worker.zip
+          
+          echo "✅ Files extracted and copied successfully"
 
-          # 添加伪变更，确保 Git 能识别为更新
-          echo "// Auto obfuscated at $(date -u)" >> _worker.js
-
-      - name: 写入或更新 version.txt
+      # 步骤 7: 提交更改
+      - name: Commit and push changes
+        if: steps.check_update.outputs.skip_update == 'false'
         run: |
-          echo "${{ env.latest_tag }}" > version.txt
+          # 检查是否有更改
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "⚠️ No changes to commit"
+            exit 0
+          fi
+          
+          # 添加所有更改的文件
+          git add .
+          
+          # 提交更改
+          git commit -m "🔧 chore: auto-update BPB Panel to $LATEST_TAG [skip ci]"
+          
+          # 推送更改
+          echo "🚀 Pushing changes to main branch..."
+          git push origin main
+          
+          echo "✅ Changes committed and pushed"
 
-      - name: 提交更改
-        uses: stefanzweifel/git-auto-commit-action@v5
+      # 步骤 8: 部署到 GitHub Pages
+      - name: Deploy to GitHub Pages
+        if: steps.check_update.outputs.skip_update == 'false'
+        uses: actions/deploy-pages@v4
         with:
-          commit_message: |
-            🔁 Obfuscate _worker.js (version: ${{ env.latest_tag }})
-          commit_author: github-actions[bot] <github-actions[bot]@users.noreply.github.com>
+          token: ${{ secrets.GITHUB_TOKEN }}
+          error_count: 1
+          timeout: 600000
+
+      # 步骤 9: 部署状态输出
+      - name: Get deployment status
+        id: deployment
+        run: |
+          echo "✅ Deployment completed successfully"
+          echo "page_url=https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}" >> $GITHUB_OUTPUT
+
+      # 步骤 10: 结果总结
+      - name: Update summary
+        run: |
+          echo "=========================================="
+          echo "           BPB Panel Auto Update          "
+          echo "=========================================="
+          
+          if [ "${{ steps.check_update.outputs.skip_update }}" = "true" ]; then
+            echo "📊 Status: No update needed"
+            echo "✅ Already at latest version: $LATEST_TAG"
+          else
+            echo "📊 Status: Update completed successfully!"
+            echo "✅ Updated to version: $LATEST_TAG"
+            echo "✅ Files updated and committed to main"
+            echo "✅ GitHub Pages deployment triggered"
+            echo "🌐 Site URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+          fi
+          
+          echo ""
+          echo "⏰ Next auto-update:"
+          echo "   UTC: 03:15 daily"
+          echo "   Beijing/Singapore: 11:15 daily"
+          echo "=========================================="
