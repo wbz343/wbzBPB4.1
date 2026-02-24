@@ -40,7 +40,21 @@ jobs:
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
 
-      # 步骤 3: 获取最新版本标签
+      # 步骤 3: 创建静态文件目录（解决 wrangler 检测问题）
+      - name: Create static directory structure
+        run: |
+          # 创建 Cloudflare Pages 期望的目录结构
+          echo "📁 Creating static directory structure for wrangler..."
+          
+          # 创建 dist 目录（Cloudflare Pages 默认查找的目录）
+          mkdir -p dist
+          
+          # 如果存在 public 目录，也创建
+          mkdir -p public
+          
+          echo "✅ Created static directories"
+
+      # 步骤 4: 获取最新版本标签
       - name: Get latest release tag
         id: get_version
         run: |
@@ -58,7 +72,7 @@ jobs:
           echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
           echo "Latest BPB version: $LATEST_TAG"
 
-      # 步骤 4: 检查是否需要更新
+      # 步骤 5: 检查是否需要更新
       - name: Check if already up-to-date
         id: check_update
         run: |
@@ -81,7 +95,7 @@ jobs:
             echo "skip_update=false" >> $GITHUB_OUTPUT
           fi
 
-      # 步骤 5: 下载最新发布包
+      # 步骤 6: 下载最新发布包
       - name: Download latest release
         if: steps.check_update.outputs.skip_update == 'false'
         run: |
@@ -100,67 +114,128 @@ jobs:
           FILE_SIZE=$(ls -lh worker.zip | awk '{print $5}')
           echo "✅ Downloaded worker.zip ($FILE_SIZE)"
 
-      # 步骤 6: 解压并部署静态文件
-      - name: Extract and deploy files
+      # 步骤 7: 解压并部署到静态目录
+      - name: Extract and deploy to static directory
         if: steps.check_update.outputs.skip_update == 'false'
         run: |
           echo "📂 Extracting worker.zip..."
           
-          # 清理旧的提取目录
-          rm -rf extracted
-          
-          # 创建提取目录
-          mkdir -p extracted
+          # 创建临时提取目录
+          mkdir -p temp_extract
           
           # 解压文件
-          if ! unzip -o worker.zip -d extracted/; then
+          if ! unzip -o worker.zip -d temp_extract/; then
             echo "❌ Failed to extract worker.zip"
             exit 1
           fi
           
           echo "📁 Extracted contents:"
-          ls -la extracted/
+          find temp_extract -type f -name "*.html" -o -name "*.js" -o -name "*.css" | head -10
           
-          # 检查解压内容结构
-          if [ -f "extracted/_worker.js" ]; then
-            echo "✅ Found _worker.js in root of extracted files"
-            cp extracted/_worker.js ./
+          # 方法 1: 检查是否有 dist 目录结构
+          if [ -d "temp_extract/dist" ]; then
+            echo "✅ Found dist directory in release"
+            # 复制 dist 目录内容到项目根目录
+            cp -r temp_extract/dist/* ./
+          # 方法 2: 检查是否有 public 目录
+          elif [ -d "temp_extract/public" ]; then
+            echo "✅ Found public directory in release"
+            cp -r temp_extract/public/* ./
+          # 方法 3: 直接复制所有静态文件到 dist 目录（Cloudflare Pages 默认查找）
           else
-            # 尝试在子目录中查找
-            echo "🔍 Looking for _worker.js in subdirectories..."
-            find extracted -name "_worker.js" -exec cp {} ./ \;
+            echo "🔍 No standard static directory found, copying all static files to dist/"
+            
+            # 清空 dist 目录
+            rm -rf dist/*
+            
+            # 查找并复制所有静态文件到 dist 目录
+            find temp_extract -type f \( -name "*.html" -o -name "*.js" -o -name "*.css" -o -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.gif" -o -name "*.svg" -o -name "*.ico" -o -name "*.woff" -o -name "*.woff2" -o -name "*.ttf" -o -name "*.json" \) \
+              -exec cp --parents {} dist/ \;
+            
+            # 如果 dist 是空的，尝试直接复制所有文件
+            if [ -z "$(ls -A dist/ 2>/dev/null)" ]; then
+              echo "⚠️ dist directory is empty, copying all extracted files"
+              cp -r temp_extract/* ./
+            fi
           fi
           
-          # 复制所有静态文件到当前目录
-          echo "📄 Copying static files..."
+          # 检查并复制 _worker.js（如果存在）
+          if [ -f "temp_extract/_worker.js" ]; then
+            echo "✅ Found _worker.js"
+            cp temp_extract/_worker.js ./
+          else
+            # 在子目录中查找 _worker.js
+            find temp_extract -name "_worker.js" -exec cp {} ./ \;
+          fi
           
-          # 查找并复制 HTML 文件
-          find extracted -name "*.html" -exec cp {} ./ \;
-          
-          # 查找并复制 JS 文件
-          find extracted -name "*.js" ! -path "*/node_modules/*" -exec cp {} ./ \;
-          
-          # 查找并复制 CSS 文件
-          find extracted -name "*.css" -exec cp {} ./ \;
-          
-          # 查找并复制其他静态资源
-          find extracted -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.gif" -o -name "*.svg" -o -name "*.ico" -o -name "*.woff" -o -name "*.woff2" -o -name "*.ttf" -o -name "*.json" | while read file; do
-            cp "$file" ./
-          done
-          
-          # 检查是否复制了必要的文件
-          echo "📊 Files copied to repository root:"
-          ls -la *.html *.js *.css 2>/dev/null || true
+          # 确保至少有 index.html 文件（Cloudflare Pages 需要）
+          if [ ! -f "index.html" ] && [ ! -f "dist/index.html" ]; then
+            echo "⚠️ No index.html found, creating a minimal one"
+            echo "<!DOCTYPE html>
+<html>
+<head>
+    <title>BPB Panel</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body>
+    <h1>BPB Panel</h1>
+    <p>Application is loading...</p>
+    <script src="app.js"></script>
+</body>
+</html>" > index.html
+          fi
           
           # 保存版本信息
           echo "$LATEST_TAG" > current_version.txt
           
-          # 清理临时文件
-          rm -rf extracted worker.zip
+          # 创建 Cloudflare Pages 配置文件（如果需要）
+          if [ ! -f "_routes.json" ]; then
+            echo '{
+  "version": 1,
+  "include": ["/*"],
+  "exclude": []
+}' > _routes.json
+          fi
           
-          echo "✅ Files extracted and copied successfully"
+          if [ ! -f "_headers" ]; then
+            echo '# Security headers
+/*
+  X-Frame-Options: DENY
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin' > _headers
+          fi
+          
+          # 清理临时文件
+          rm -rf temp_extract worker.zip
+          
+          echo "✅ Files extracted and deployed"
+          echo "📊 Current directory structure:"
+          ls -la
 
-      # 步骤 7: 提交更改
+      # 步骤 8: 创建或更新 wrangler.toml（可选）
+      - name: Configure wrangler if needed
+        if: steps.check_update.outputs.skip_update == 'false'
+        run: |
+          # 如果不存在 wrangler.toml，创建一个基础配置
+          if [ ! -f "wrangler.toml" ]; then
+            echo "📝 Creating basic wrangler.toml for Cloudflare Pages"
+            
+            cat > wrangler.toml << 'EOF'
+name = "bpb-panel"
+compatibility_date = "$(date +%Y-%m-%d)"
+pages_build_output_dir = "dist"
+EOF
+            
+            # 如果 dist 目录存在但为空，则更新配置
+            if [ -d "dist" ] && [ -n "$(ls -A dist/ 2>/dev/null)" ]; then
+              echo 'pages_build_output_dir = "dist"' >> wrangler.toml
+            else
+              echo 'pages_build_output_dir = "."' >> wrangler.toml
+            fi
+          fi
+
+      # 步骤 9: 提交更改
       - name: Commit and push changes
         if: steps.check_update.outputs.skip_update == 'false'
         run: |
@@ -182,38 +257,57 @@ jobs:
           
           echo "✅ Changes committed and pushed"
 
-      # 步骤 8: 部署到 GitHub Pages
+      # 步骤 10: 部署到 GitHub Pages
+      - name: Setup Pages
+        if: steps.check_update.outputs.skip_update == 'false'
+        uses: actions/configure-pages@v4
+
+      - name: Upload artifact
+        if: steps.check_update.outputs.skip_update == 'false'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          # 上传 dist 目录或当前目录
+          path: |
+            dist/
+            ./
+          retention-days: 1
+
       - name: Deploy to GitHub Pages
         if: steps.check_update.outputs.skip_update == 'false'
+        id: deployment
         uses: actions/deploy-pages@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          error_count: 1
-          timeout: 600000
 
-      # 步骤 9: 部署状态输出
-      - name: Get deployment status
-        id: deployment
-        run: |
-          echo "✅ Deployment completed successfully"
-          echo "page_url=https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}" >> $GITHUB_OUTPUT
-
-      # 步骤 10: 结果总结
+      # 步骤 11: 结果总结
       - name: Update summary
         run: |
+          echo ""
           echo "=========================================="
           echo "           BPB Panel Auto Update          "
           echo "=========================================="
           
           if [ "${{ steps.check_update.outputs.skip_update }}" = "true" ]; then
             echo "📊 Status: No update needed"
-            echo "✅ Already at latest version: $LATEST_TAG"
+            echo "✅ Already at latest version: ${{ env.LATEST_TAG }}"
           else
             echo "📊 Status: Update completed successfully!"
-            echo "✅ Updated to version: $LATEST_TAG"
+            echo "✅ Updated to version: ${{ env.LATEST_TAG }}"
             echo "✅ Files updated and committed to main"
             echo "✅ GitHub Pages deployment triggered"
-            echo "🌐 Site URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+            
+            if [ -d "dist" ] && [ -n "$(ls -A dist/ 2>/dev/null)" ]; then
+              echo "📁 Static files location: dist/"
+            else
+              echo "📁 Static files location: root directory"
+            fi
+            
+            # 检查是否有 index.html
+            if [ -f "index.html" ] || [ -f "dist/index.html" ]; then
+              echo "✅ Found index.html"
+            else
+              echo "⚠️ Warning: No index.html found"
+            fi
           fi
           
           echo ""
